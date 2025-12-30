@@ -17,6 +17,7 @@ Publish the app in release configuration `dotnet publish -c Release`, then run t
 | #5 | 00:01:38.48 | 98484 | [1] | Setting the project to be AoT (ahead of time) compiled. Had a negativ impact. |
 | #6 | 00:01:40.21 | 100212 | [1] | Added a simple list with the three first bytes in the name to be able to sort it faster and then just lookup in the dictionary. |
 | #7 | 00:00:20.52 | 20523 | [1] | Introduced paralell processing and SIMD friendly parsing. |
+| #8 | 00:00:00.02 | 23 | [1] | Introducted un-safe code and more SIMD parsing. |
 
 ### Machines
 
