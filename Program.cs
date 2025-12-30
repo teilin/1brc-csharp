@@ -16,7 +16,8 @@ var mmap = MemoryMappedFile.CreateFromFile(filePath);
 
 using var fs = mmap.CreateViewStream();
 
-var hm = new Dictionary<byte[], Measurement>(new ByteArrayComparer());
+var head = new List<byte[]>();
+var hm = new Dictionary<byte[], Measurement>();
 
 var nameBuffer = new List<byte>();
 var valueBuffer = new List<byte>();
@@ -86,21 +87,25 @@ while (true)
     }
     if (isNegative) value = -value;
 
-    if (hm.ContainsKey(name))
+    head.Add(name[..3]);
+
+    if (hm.ContainsKey(name[..3]))
     {
-        hm[name].Add(value);
+        hm[name[..3]].Add(value, name);
     }
     else
     {
         var tmp = new Measurement();
-        tmp.Add(value);
-        hm.Add(name, tmp);
+        tmp.Add(value, name);
+        hm.Add(name[..3], tmp);
     }
 }
 
-foreach (var v in hm.OrderBy(o => Encoding.UTF8.GetString(o.Key)))
+head.Sort(new ByteArrayLexicographicComparer());
+
+foreach (var v in head)
 {
-    Console.WriteLine($"{Encoding.UTF8.GetString(v.Key)};{v.Value.ToString()}");
+    Console.WriteLine($"{Encoding.UTF8.GetString(hm[v].Key)};{hm[v]}");
 }
 
 stopwatch.Stop();
@@ -112,28 +117,44 @@ string formatTime = String.Format("{0:00}:{1:00}:{2:00}.{3:00}",
 Console.WriteLine($"RunTime: {formatTime}");
 Console.WriteLine($"Elapsed milliseconds: {stopwatch.ElapsedMilliseconds}");
 
-internal sealed class ByteArrayComparer : IEqualityComparer<byte[]>
-{
-    public bool Equals(byte[]? x, byte[]? y)
-    {
-        if (x == null || y == null) return x == y;
-        if (x.Length != y.Length) return false;
-        for (int i = 0; i < x.Length; i++)
-        {
-            if (x[i] != y[i]) return false;
-        }
-        return true;
-    }
+// internal sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+// {
+//     public bool Equals(byte[]? x, byte[]? y)
+//     {
+//         if (x == null || y == null) return x == y;
+//         if (x.Length != y.Length) return false;
+//         for (int i = 0; i < x.Length; i++)
+//         {
+//             if (x[i] != y[i]) return false;
+//         }
+//         return true;
+//     }
 
-    public int GetHashCode(byte[] obj)
+//     public int GetHashCode(byte[] obj)
+//     {
+//         if (obj == null) return 0;
+//         int hash = 17;
+//         foreach (byte b in obj)
+//         {
+//             hash = hash * 31 + b;
+//         }
+//         return hash;
+//     }
+// }
+
+internal sealed class ByteArrayLexicographicComparer : IComparer<byte[]>
+{
+    public int Compare(byte[]? x, byte[]? y)
     {
-        if (obj == null) return 0;
-        int hash = 17;
-        foreach (byte b in obj)
+        if (x == null) return y == null ? 0 : -1;
+        if (y == null) return 1;
+        
+        int minLen = Math.Min(x.Length, y.Length);
+        for (int i = 0; i < minLen; i++)
         {
-            hash = hash * 31 + b;
+            if (x[i] != y[i]) return x[i].CompareTo(y[i]);
         }
-        return hash;
+        return x.Length.CompareTo(y.Length);
     }
 }
 
@@ -143,9 +164,13 @@ internal sealed class Measurement
     private long _sum = 0;
     private int _min = int.MaxValue;
     private int _max = int.MinValue;
+    private byte[] _key = new byte[0];
 
-    public void Add(int value)
+    public byte[] Key => _key;
+
+    public void Add(int value, byte[] key)
     {
+        _key = key;
         _count++;
         _sum += value;
         if (_min > value) _min = value;
