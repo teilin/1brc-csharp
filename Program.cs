@@ -1,12 +1,8 @@
 ﻿using System.Diagnostics;
-using System.Dynamic;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
 using System.Text;
 using System.Collections.Concurrent;
-using System.Numerics;
-using System.Runtime.InteropServices;
-using System.Runtime.Intrinsics;
 
 CultureInfo newCulture = new("en-US");
 Thread.CurrentThread.CurrentCulture = newCulture;
@@ -19,13 +15,11 @@ var filePath = Path.Combine("/Users/teis/code/1brc-files", "measurements-full.tx
 var fileInfo = new FileInfo(filePath);
 long fileSize = fileInfo.Length;
 
-// Determine number of chunks based on CPU cores
 int numThreads = Environment.ProcessorCount;
 long chunkSize = fileSize / numThreads;
 
 var results = new ConcurrentDictionary<byte[], Measurement>(new ByteArrayComparer());
 
-// Process chunks in parallel
 Parallel.For(0, numThreads, threadIndex =>
 {
     using var mmap = MemoryMappedFile.CreateFromFile(filePath);
@@ -33,7 +27,6 @@ Parallel.For(0, numThreads, threadIndex =>
     long startPos = threadIndex * chunkSize;
     long endPos = (threadIndex == numThreads - 1) ? fileSize : (threadIndex + 1) * chunkSize;
     
-    // Adjust start position to next newline (except for first chunk)
     if (threadIndex > 0)
     {
         using var adjustStream = mmap.CreateViewStream(startPos, endPos - startPos, MemoryMappedFileAccess.Read);
@@ -42,7 +35,7 @@ Parallel.For(0, numThreads, threadIndex =>
         {
             startPos++;
         }
-        startPos++; // Skip the newline
+        startPos++;
     }
     
     if (startPos >= endPos) return;
@@ -50,7 +43,6 @@ Parallel.For(0, numThreads, threadIndex =>
     using var stream = mmap.CreateViewStream(startPos, endPos - startPos, MemoryMappedFileAccess.Read);
     var localResults = ProcessChunk(stream, endPos - startPos);
     
-    // Merge results into concurrent dictionary
     foreach (var kvp in localResults)
     {
         results.AddOrUpdate(kvp.Key, kvp.Value, (key, existing) =>
@@ -61,7 +53,6 @@ Parallel.For(0, numThreads, threadIndex =>
     }
 });
 
-// Sort and output
 foreach (var v in results.OrderBy(o => o.Key, new ByteArrayLexicographicComparer()))
 {
     Console.WriteLine($"{Encoding.UTF8.GetString(v.Key)};{v.Value}");
@@ -157,7 +148,6 @@ static Dictionary<byte[], Measurement> ProcessChunk(Stream stream, long maxBytes
 
 static int ParseTemperature(byte[] buffer, int length)
 {
-    // Fast path for common cases using SIMD-friendly approach
     int value = 0;
     bool isNegative = false;
     int startIdx = 0;
@@ -168,8 +158,6 @@ static int ParseTemperature(byte[] buffer, int length)
         startIdx = 1;
     }
     
-    // Unrolled loop for better performance
-    // Common formats: X.X (3 chars), XX.X (4 chars), -X.X (4 chars), -XX.X (5 chars)
     for (int i = startIdx; i < length; i++)
     {
         byte bt = buffer[i];
