@@ -16,30 +16,91 @@ var mmap = MemoryMappedFile.CreateFromFile(filePath);
 
 using var fs = mmap.CreateViewStream();
 
-using var reader = new StreamReader(fs, Encoding.UTF8);
+var hm = new Dictionary<byte[], Measurement>(new ByteArrayComparer());
 
-var hm = new OrderedDictionary<string, Measurement>();
+var nameBuffer = new List<byte>();
+var valueBuffer = new List<byte>();
+var buffer = new byte[8192];
+int bytesRead;
+int bufferPos = 0;
+int bufferEnd = 0;
 
-string line;
-while ((line = await reader.ReadLineAsync()) != null)
+byte GetNextByte()
 {
-    var split = line.Split(';');
-
-    if (hm.ContainsKey(split[0]))
+    if (bufferPos >= bufferEnd)
     {
-        hm[split[0]].Add(Convert.ToDouble(split[1]));
+        bytesRead = fs.Read(buffer, 0, buffer.Length);
+        if (bytesRead == 0) return 0;
+        bufferPos = 0;
+        bufferEnd = bytesRead;
+    }
+    return buffer[bufferPos++];
+}
+
+while (true)
+{
+    // Read station name until ';'
+    nameBuffer.Clear();
+    byte b;
+    while ((b = GetNextByte()) != 0 && b != (byte)';')
+    {
+        nameBuffer.Add(b);
+    }
+
+    if (b == 0) break; // End of file
+
+    // Read temperature value until newline
+    valueBuffer.Clear();
+    while ((b = GetNextByte()) != 0 && b != (byte)'\n' && b != (byte)'\r')
+    {
+        valueBuffer.Add(b);
+    }
+
+    // Skip any additional newline characters
+    if (b == (byte)'\r')
+    {
+        byte next = GetNextByte();
+        if (next != (byte)'\n' && next != 0)
+        {
+            bufferPos--; // Put back if not \n
+        }
+    }
+
+    if (nameBuffer.Count == 0) break; // End of file
+
+    var name = nameBuffer.ToArray();
+    
+    // Parse value as int, skipping decimal point
+    int value = 0;
+    bool isNegative = false;
+    foreach (byte bt in valueBuffer)
+    {
+        if (bt == (byte)'-')
+        {
+            isNegative = true;
+        }
+        else if (bt != (byte)'.')
+        {
+            value = value * 10 + (bt - (byte)'0');
+        }
+    }
+    if (isNegative) value = -value;
+
+    if (hm.ContainsKey(name))
+    {
+        hm[name].Add(value);
     }
     else
     {
         var tmp = new Measurement();
-        tmp.Add(Convert.ToDouble(split[1]));
-        hm.Add(split[0], tmp);
+        tmp.Add(value);
+        hm.Add(name, tmp);
     }
 }
 
-foreach (KeyValuePair<string, Measurement> v in hm.OrderBy(o => o.Key))
+foreach (var v in hm.OrderBy(o => Encoding.UTF8.GetString(o.Key)))
 {
-    Console.WriteLine($"{v.Key};{v.Value.ToString()}");
+    Console.WriteLine($"{Encoding.UTF8.GetString(v.Key)};{v.Value.ToString()}");
 }
 
 stopwatch.Stop();
@@ -51,14 +112,39 @@ string formatTime = String.Format("{0:00}:{1:00}:{2:00}.{3:00}",
 Console.WriteLine($"RunTime: {formatTime}");
 Console.WriteLine($"Elapsed milliseconds: {stopwatch.ElapsedMilliseconds}");
 
+internal sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+{
+    public bool Equals(byte[]? x, byte[]? y)
+    {
+        if (x == null || y == null) return x == y;
+        if (x.Length != y.Length) return false;
+        for (int i = 0; i < x.Length; i++)
+        {
+            if (x[i] != y[i]) return false;
+        }
+        return true;
+    }
+
+    public int GetHashCode(byte[] obj)
+    {
+        if (obj == null) return 0;
+        int hash = 17;
+        foreach (byte b in obj)
+        {
+            hash = hash * 31 + b;
+        }
+        return hash;
+    }
+}
+
 internal sealed class Measurement
 {
     private int _count = 0;
-    private double _sum = 0;
-    private double _min = 0.0;
-    private double _max = 0.0;
+    private long _sum = 0;
+    private int _min = int.MaxValue;
+    private int _max = int.MinValue;
 
-    public void Add(double value)
+    public void Add(int value)
     {
         _count++;
         _sum += value;
@@ -68,6 +154,9 @@ internal sealed class Measurement
 
     public override string ToString()
     {
-        return $"{_min};{(_sum/_count).ToString("F2")};{_max}";
+        double min = _min / 10.0;
+        double avg = (_sum / (double)_count) / 10.0;
+        double max = _max / 10.0;
+        return $"{min:F1};{avg:F1};{max:F1}";
     }
 }
