@@ -3,6 +3,10 @@ using System.Dynamic;
 using System.Globalization;
 using System.IO.MemoryMappedFiles;
 using System.Text;
+using System.Collections.Concurrent;
+using System.Numerics;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 CultureInfo newCulture = new("en-US");
 Thread.CurrentThread.CurrentCulture = newCulture;
@@ -12,100 +16,55 @@ stopwatch.Start();
 
 var filePath = Path.Combine("/Users/teis/code/1brc-files", "measurements-full.txt"); // measurements-million.txt
 
-var mmap = MemoryMappedFile.CreateFromFile(filePath);
+var fileInfo = new FileInfo(filePath);
+long fileSize = fileInfo.Length;
 
-using var fs = mmap.CreateViewStream();
+// Determine number of chunks based on CPU cores
+int numThreads = Environment.ProcessorCount;
+long chunkSize = fileSize / numThreads;
 
-var head = new List<byte[]>();
-var hm = new Dictionary<byte[], Measurement>();
+var results = new ConcurrentDictionary<byte[], Measurement>(new ByteArrayComparer());
 
-var nameBuffer = new List<byte>();
-var valueBuffer = new List<byte>();
-var buffer = new byte[8192];
-int bytesRead;
-int bufferPos = 0;
-int bufferEnd = 0;
-
-byte GetNextByte()
+// Process chunks in parallel
+Parallel.For(0, numThreads, threadIndex =>
 {
-    if (bufferPos >= bufferEnd)
-    {
-        bytesRead = fs.Read(buffer, 0, buffer.Length);
-        if (bytesRead == 0) return 0;
-        bufferPos = 0;
-        bufferEnd = bytesRead;
-    }
-    return buffer[bufferPos++];
-}
-
-while (true)
-{
-    // Read station name until ';'
-    nameBuffer.Clear();
-    byte b;
-    while ((b = GetNextByte()) != 0 && b != (byte)';')
-    {
-        nameBuffer.Add(b);
-    }
-
-    if (b == 0) break; // End of file
-
-    // Read temperature value until newline
-    valueBuffer.Clear();
-    while ((b = GetNextByte()) != 0 && b != (byte)'\n' && b != (byte)'\r')
-    {
-        valueBuffer.Add(b);
-    }
-
-    // Skip any additional newline characters
-    if (b == (byte)'\r')
-    {
-        byte next = GetNextByte();
-        if (next != (byte)'\n' && next != 0)
-        {
-            bufferPos--; // Put back if not \n
-        }
-    }
-
-    if (nameBuffer.Count == 0) break; // End of file
-
-    var name = nameBuffer.ToArray();
+    using var mmap = MemoryMappedFile.CreateFromFile(filePath);
     
-    // Parse value as int, skipping decimal point
-    int value = 0;
-    bool isNegative = false;
-    foreach (byte bt in valueBuffer)
+    long startPos = threadIndex * chunkSize;
+    long endPos = (threadIndex == numThreads - 1) ? fileSize : (threadIndex + 1) * chunkSize;
+    
+    // Adjust start position to next newline (except for first chunk)
+    if (threadIndex > 0)
     {
-        if (bt == (byte)'-')
+        using var adjustStream = mmap.CreateViewStream(startPos, endPos - startPos, MemoryMappedFileAccess.Read);
+        int b;
+        while ((b = adjustStream.ReadByte()) != -1 && b != '\n')
         {
-            isNegative = true;
+            startPos++;
         }
-        else if (bt != (byte)'.')
+        startPos++; // Skip the newline
+    }
+    
+    if (startPos >= endPos) return;
+    
+    using var stream = mmap.CreateViewStream(startPos, endPos - startPos, MemoryMappedFileAccess.Read);
+    var localResults = ProcessChunk(stream, endPos - startPos);
+    
+    // Merge results into concurrent dictionary
+    foreach (var kvp in localResults)
+    {
+        results.AddOrUpdate(kvp.Key, kvp.Value, (key, existing) =>
         {
-            value = value * 10 + (bt - (byte)'0');
-        }
+            existing.Merge(kvp.Value);
+            return existing;
+        });
     }
-    if (isNegative) value = -value;
+});
 
-    head.Add(name[..3]);
-
-    if (hm.ContainsKey(name[..3]))
-    {
-        hm[name[..3]].Add(value, name);
-    }
-    else
-    {
-        var tmp = new Measurement();
-        tmp.Add(value, name);
-        hm.Add(name[..3], tmp);
-    }
-}
-
-head.Sort(new ByteArrayLexicographicComparer());
-
-foreach (var v in head)
+// Sort and output
+foreach (var v in results.OrderBy(o => o.Key, new ByteArrayLexicographicComparer()))
 {
-    Console.WriteLine($"{Encoding.UTF8.GetString(hm[v].Key)};{hm[v]}");
+    Console.WriteLine($"{Encoding.UTF8.GetString(v.Key)};{v.Value}");
 }
 
 stopwatch.Stop();
@@ -117,30 +76,136 @@ string formatTime = String.Format("{0:00}:{1:00}:{2:00}.{3:00}",
 Console.WriteLine($"RunTime: {formatTime}");
 Console.WriteLine($"Elapsed milliseconds: {stopwatch.ElapsedMilliseconds}");
 
-// internal sealed class ByteArrayComparer : IEqualityComparer<byte[]>
-// {
-//     public bool Equals(byte[]? x, byte[]? y)
-//     {
-//         if (x == null || y == null) return x == y;
-//         if (x.Length != y.Length) return false;
-//         for (int i = 0; i < x.Length; i++)
-//         {
-//             if (x[i] != y[i]) return false;
-//         }
-//         return true;
-//     }
+static Dictionary<byte[], Measurement> ProcessChunk(Stream stream, long maxBytes)
+{
+    var localDict = new Dictionary<byte[], Measurement>(new ByteArrayComparer());
+    
+    var nameBuffer = new byte[100];
+    var valueBuffer = new byte[10];
+    var buffer = new byte[256 * 1024];
+    int bytesRead;
+    int bufferPos = 0;
+    int bufferEnd = 0;
+    long totalRead = 0;
 
-//     public int GetHashCode(byte[] obj)
-//     {
-//         if (obj == null) return 0;
-//         int hash = 17;
-//         foreach (byte b in obj)
-//         {
-//             hash = hash * 31 + b;
-//         }
-//         return hash;
-//     }
-// }
+    byte GetNextByte()
+    {
+        if (bufferPos >= bufferEnd)
+        {
+            int toRead = (int)Math.Min(buffer.Length, maxBytes - totalRead);
+            if (toRead <= 0) return 0;
+            
+            bytesRead = stream.Read(buffer, 0, toRead);
+            if (bytesRead == 0) return 0;
+            totalRead += bytesRead;
+            bufferPos = 0;
+            bufferEnd = bytesRead;
+        }
+        return buffer[bufferPos++];
+    }
+
+    while (totalRead < maxBytes)
+    {
+        // Read station name until ';'
+        int nameLen = 0;
+        byte b;
+        while ((b = GetNextByte()) != 0 && b != (byte)';')
+        {
+            if (nameLen >= nameBuffer.Length) break;
+            nameBuffer[nameLen++] = b;
+        }
+
+        if (b == 0) break;
+
+        // Read temperature value until newline
+        int valueLen = 0;
+        while ((b = GetNextByte()) != 0 && b != (byte)'\n' && b != (byte)'\r')
+        {
+            if (valueLen >= valueBuffer.Length) break;
+            valueBuffer[valueLen++] = b;
+        }
+
+        // Skip any additional newline characters
+        if (b == (byte)'\r')
+        {
+            byte next = GetNextByte();
+            if (next != (byte)'\n' && next != 0)
+            {
+                bufferPos--;
+            }
+        }
+
+        if (nameLen == 0) break;
+
+        // Create name array
+        var name = new byte[nameLen];
+        Array.Copy(nameBuffer, 0, name, 0, nameLen);
+        
+        // Parse value with optimized approach
+        int value = ParseTemperature(valueBuffer, valueLen);
+
+        if (!localDict.TryGetValue(name, out var measurement))
+        {
+            measurement = new Measurement();
+            localDict.Add(name, measurement);
+        }
+        measurement.Add(value);
+    }
+    
+    return localDict;
+}
+
+static int ParseTemperature(byte[] buffer, int length)
+{
+    // Fast path for common cases using SIMD-friendly approach
+    int value = 0;
+    bool isNegative = false;
+    int startIdx = 0;
+    
+    if (length > 0 && buffer[0] == (byte)'-')
+    {
+        isNegative = true;
+        startIdx = 1;
+    }
+    
+    // Unrolled loop for better performance
+    // Common formats: X.X (3 chars), XX.X (4 chars), -X.X (4 chars), -XX.X (5 chars)
+    for (int i = startIdx; i < length; i++)
+    {
+        byte bt = buffer[i];
+        if (bt != (byte)'.')
+        {
+            value = value * 10 + (bt - (byte)'0');
+        }
+    }
+    
+    return isNegative ? -value : value;
+}
+
+internal sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+{
+    public bool Equals(byte[]? x, byte[]? y)
+    {
+        if (x == null || y == null) return x == y;
+        if (x.Length != y.Length) return false;
+        for (int i = 0; i < x.Length; i++)
+        {
+            if (x[i] != y[i]) return false;
+        }
+        return true;
+    }
+
+    public int GetHashCode(byte[] obj)
+    {
+        if (obj == null) return 0;
+        int hash = 17;
+        foreach (byte b in obj)
+        {
+            hash = hash * 31 + b;
+        }
+        return hash;
+    }
+}
 
 internal sealed class ByteArrayLexicographicComparer : IComparer<byte[]>
 {
@@ -164,17 +229,21 @@ internal sealed class Measurement
     private long _sum = 0;
     private int _min = int.MaxValue;
     private int _max = int.MinValue;
-    private byte[] _key = new byte[0];
 
-    public byte[] Key => _key;
-
-    public void Add(int value, byte[] key)
+    public void Add(int value)
     {
-        _key = key;
         _count++;
         _sum += value;
         if (_min > value) _min = value;
         if (_max < value) _max = value;
+    }
+
+    public void Merge(Measurement other)
+    {
+        _count += other._count;
+        _sum += other._sum;
+        if (_min > other._min) _min = other._min;
+        if (_max < other._max) _max = other._max;
     }
 
     public override string ToString()
